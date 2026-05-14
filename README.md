@@ -100,15 +100,15 @@ curl http://localhost:3000/api/v1/status_by_trackingcode/75BA1F73
 
 ### Status auto-progression
 
-A new order moves through statuses on its own:
+A new order moves through statuses on its own — a background ticker scans all consignments every 2 seconds and advances them based on age. **No polling required:** webhooks fire on time even if nothing queries the order.
 
 | Time since creation | Status |
 |---|---|
-| 0–30s | `in_review` |
-| 30–60s | `pending` (fires webhook) |
-| 60s+ | `delivered` (fires webhook + credits balance) |
+| 0–15s | `in_review` |
+| 15–30s | `pending` (fires webhook) |
+| 30s+ | `delivered` (fires webhook + credits balance) |
 
-To override timing edit `IN_REVIEW_MS` / `PENDING_MS` near the top of [server.js](server.js).
+To change timing, edit `IN_REVIEW_MS`, `PENDING_MS`, and `TICKER_MS` in `.env`. Set `TICKER_MS=0` to disable the ticker (status will then only advance when something queries the order).
 
 ### Check balance
 
@@ -164,7 +164,7 @@ WEBHOOK_DELIVERY_CHARGE=60            # value placed in payload's delivery_charg
 Webhook target: http://localhost:4000/steadfast-webhook (Bearer auth)
 ```
 
-**Step 3.** Create an order and wait 30s — your receiver gets:
+**Step 3.** Create an order and wait 15s — the background ticker fires the webhook automatically. Your receiver gets:
 
 ```json
 {
@@ -255,14 +255,24 @@ cp .env.example .env
 | `WEBHOOK_URL` | _(empty)_ | Where to POST `delivery_status` webhooks. Empty = disabled. |
 | `WEBHOOK_SECRET` | _(empty)_ | Bearer token sent in `Authorization` header on webhooks |
 | `WEBHOOK_DELIVERY_CHARGE` | `60` | Value placed in webhook payload's `delivery_charge` field |
+| `IN_REVIEW_MS` | `15000` | How long (ms) a new order stays in `in_review` before moving to `pending` |
+| `PENDING_MS` | `15000` | How long (ms) an order stays in `pending` before moving to `delivered` |
+| `TICKER_MS` | `2000` | Background ticker interval (ms). Set to `0` to disable — statuses then only advance on query. |
 
 `.env` is git-ignored. Only `.env.example` is committed.
 
 ---
 
-## 8. Limitations
+## 8. Persistence
 
-- **State is in-memory** — restart wipes all orders, returns, payments, and balance.
+State is saved to **`data/state.json`** on every mutation and reloaded on startup. The folder and file are auto-created on first save — you don't need to create them.
+
+- Orders, return requests, payments, balance, and ID counters all persist across restarts.
+- To start fresh, either `POST /_mock/reset` or just delete `data/state.json`.
+- `data/` is git-ignored so test data never leaks into commits.
+
+## 9. Limitations
+
 - **No authentication** — anyone hitting the URL can read/write. Don't expose this to the public internet without adding your own auth.
 - **`tracking_update` webhook events are not auto-fired.** Only `delivery_status` events fire (on real status transitions).
 - **Police-stations data is hard-coded** to 10 sample entries — adjust [server.js](server.js) if your tests need a richer list.
@@ -274,4 +284,4 @@ cp .env.example .env
 | Command | What it does |
 |---|---|
 | `npm start` | Run the server, loading `.env` if present |
-| `npm run dev` | Same, with `--watch` to auto-restart on file changes |
+| `npm run dev` | Run via **nodemon** with auto-restart on `server.js` / `.env` changes. Ignores `data/` so writes don't trigger a restart loop. |

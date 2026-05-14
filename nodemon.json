@@ -1,0 +1,11 @@
+{
+  "exec": "node --env-file-if-exists=.env server.js",
+  "watch": ["server.js", ".env"],
+  "ext": "js,json",
+  "ignore": [
+    "data/",
+    "node_modules/",
+    "*.tmp"
+  ],
+  "delay": 200
+}

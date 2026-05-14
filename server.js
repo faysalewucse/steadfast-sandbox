@@ -1,10 +1,18 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const BASE = '/api/v1';
+
+// ---------- Persistence ----------
+// Data is stored as a single JSON file under ./data/state.json. The folder
+// and file are created on first save; loaded on every startup.
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'state.json');
 
 // ---------- Webhook config ----------
 // Configure on startup:
@@ -73,11 +81,58 @@ let nextReturnRequestId = 1;
 let nextPaymentId = 1;
 let currentBalance = 0;
 
+// ---------- Load / save state ----------
+function loadState() {
+  if (!fs.existsSync(DATA_FILE)) return;
+  try {
+    const snap = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    for (const c of snap.consignments || []) {
+      consignments.set(c.consignment_id, c);
+      byInvoice.set(c.invoice, c.consignment_id);
+      byTracking.set(c.tracking_code, c.consignment_id);
+    }
+    for (const rr of snap.returnRequests || []) returnRequests.set(rr.id, rr);
+    for (const p of snap.payments || []) payments.set(p.id, p);
+    if (typeof snap.nextConsignmentId === 'number') nextConsignmentId = snap.nextConsignmentId;
+    if (typeof snap.nextReturnRequestId === 'number') nextReturnRequestId = snap.nextReturnRequestId;
+    if (typeof snap.nextPaymentId === 'number') nextPaymentId = snap.nextPaymentId;
+    if (typeof snap.currentBalance === 'number') currentBalance = snap.currentBalance;
+    console.log(`Loaded state from ${DATA_FILE} (${consignments.size} consignments, ${returnRequests.size} returns, ${payments.size} payments)`);
+  } catch (err) {
+    console.warn(`Could not parse ${DATA_FILE} (${err.message}). Starting with empty state.`);
+  }
+}
+
+function saveState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const snap = {
+      consignments: Array.from(consignments.values()),
+      returnRequests: Array.from(returnRequests.values()),
+      payments: Array.from(payments.values()),
+      nextConsignmentId,
+      nextReturnRequestId,
+      nextPaymentId,
+      currentBalance,
+    };
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(snap, null, 2));
+    fs.renameSync(tmp, DATA_FILE); // atomic on POSIX
+  } catch (err) {
+    console.warn(`Could not save state: ${err.message}`);
+  }
+}
+
+loadState();
+
 // ---------- Status auto-progression ----------
 // Real Steadfast: in_review -> pending -> delivered (and balance credited)
-// Mock timing: 30s in_review, then 30s pending, then delivered
-const IN_REVIEW_MS = 30_000;
-const PENDING_MS = 30_000;
+// Mock timing: in_review for 15s, then pending until 30s mark, then delivered.
+// A background ticker (TICKER_MS) advances statuses without requiring a poll,
+// so webhooks fire automatically at the 15s and 30s marks.
+const IN_REVIEW_MS = Number(process.env.IN_REVIEW_MS) || 15_000;
+const PENDING_MS = Number(process.env.PENDING_MS) || 15_000;
+const TICKER_MS = Number(process.env.TICKER_MS) || 2_000; // set 0 to disable
 
 function progressStatus(consignmentId) {
   const c = consignments.get(consignmentId);
@@ -95,6 +150,7 @@ function progressStatus(consignmentId) {
       currentBalance += Number(c.cod_amount) || 0;
       c._creditedBalance = true;
     }
+    saveState();
     fireDeliveryStatusWebhook(c);
   }
 }
@@ -155,6 +211,7 @@ function buildOrder(input) {
   consignments.set(consignment_id, consignment);
   byInvoice.set(consignment.invoice, consignment_id);
   byTracking.set(tracking_code, consignment_id);
+  saveState();
   return { consignment };
 }
 
@@ -273,6 +330,7 @@ app.post(`${BASE}/create_return_request`, (req, res) => {
     updated_at: now,
   };
   returnRequests.set(id, rr);
+  saveState();
   return res.status(200).json(rr);
 });
 
@@ -348,6 +406,7 @@ app.post('/_mock/set_status/:id', (req, res) => {
     currentBalance += Number(c.cod_amount) || 0;
     c._creditedBalance = true;
   }
+  saveState();
   fireDeliveryStatusWebhook(c);
   res.json(publicView(c));
 });
@@ -362,6 +421,7 @@ app.post('/_mock/reset', (req, res) => {
   nextReturnRequestId = 1;
   nextPaymentId = 1;
   currentBalance = 0;
+  saveState();
   res.json({ message: 'reset' });
 });
 
@@ -377,6 +437,7 @@ app.post('/_mock/seed_payment', (req, res) => {
     consignments: consignment_ids.map((cid) => publicView(consignments.get(cid))),
   };
   payments.set(id, payment);
+  saveState();
   res.json(payment);
 });
 
@@ -420,9 +481,18 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`Steadfast mock sandbox running at http://localhost:${PORT}`);
   console.log(`Base URL: http://localhost:${PORT}${BASE}`);
+  console.log(`Auto-progression: in_review (${IN_REVIEW_MS / 1000}s) → pending (${PENDING_MS / 1000}s) → delivered`);
   if (WEBHOOK_URL) {
     console.log(`Webhook target: ${WEBHOOK_URL}${WEBHOOK_SECRET ? ' (Bearer auth)' : ''}`);
   } else {
     console.log(`Webhook target: none (set WEBHOOK_URL to enable delivery_status webhooks)`);
+  }
+  if (TICKER_MS > 0) {
+    console.log(`Background ticker: every ${TICKER_MS / 1000}s (advances statuses + fires webhooks without polling)`);
+    setInterval(() => {
+      for (const id of consignments.keys()) progressStatus(id);
+    }, TICKER_MS).unref(); // don't keep process alive just for the ticker
+  } else {
+    console.log('Background ticker: disabled (set TICKER_MS > 0 to enable)');
   }
 });
